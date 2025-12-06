@@ -1,34 +1,40 @@
 #!/usr/bin/env python3
 """
-HPC Main Entry Point for FT-LLM Demo - Phase 3
+HPC Main Entry Point for FT-LLM Demo - Phase 4
 
 Now runs with torch.distributed (NCCL) if started with multiple tasks.
 
 - Rank 0:
-    * Loads LLaMA model (unless --fake-mode)
+    * Owns TPModelEngine (which in turn may own a real LLaMA model)
     * Creates WebSocket client and serves UI requests
+    * Participates in NCCL heartbeat in the background
+
 - Ranks 1..world_size-1:
     * Join NCCL group
     * Run a simple all-reduce loop as a "heartbeat"
+
+The TPModelEngine is the abstraction we will later extend for real
+multi-GPU tensor parallelism and KV/RS distribution.
 """
 
 import os
 import asyncio
 import argparse
+
 import torch
 import torch.distributed as dist
 
 from hpc_ws_client import HPCWebSocketClient
-from llama_model import LlamaChatModel
 from dist_init import init_distributed, destroy_distributed
+from tp_engine import TPModelEngine
 
 
 async def distributed_worker_loop(rank: int, world_size: int) -> None:
     """
     Simple NCCL heartbeat loop for non-zero ranks.
-    
+
     Each worker maintains a tensor with its rank id and participates
-    in an all-reduce every second. Rank 0 occasionally logs the sum.
+    in an all-reduce every second. Logs occasionally so we can see NCCL is alive.
     """
     if not dist.is_initialized() or world_size <= 1:
         print(f"[Worker {rank}] dist not initialized (world_size={world_size}), idle.")
@@ -47,13 +53,11 @@ async def distributed_worker_loop(rank: int, world_size: int) -> None:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
             step += 1
 
-            # Log occasionally (only from this rank to avoid spam)
             if step % 30 == 0:
                 print(f"[Worker {rank}] NCCL heartbeat step={step}, sum={tensor.item():.1f}")
 
             # Reset tensor for next iteration
             tensor.fill_(float(rank))
-
             await asyncio.sleep(1.0)
 
     except asyncio.CancelledError:
@@ -65,7 +69,7 @@ async def distributed_worker_loop(rank: int, world_size: int) -> None:
 async def rank0_worker_loop(world_size: int) -> None:
     """
     NCCL heartbeat loop for rank 0 (runs alongside WebSocket client).
-    
+
     This keeps rank 0 participating in the all-reduce operations
     initiated by other ranks.
     """
@@ -76,7 +80,7 @@ async def rank0_worker_loop(world_size: int) -> None:
     tensor = torch.tensor([0.0], device=device)  # Rank 0
     step = 0
 
-    print(f"[Rank 0] Starting NCCL heartbeat (background)")
+    print(f"[Rank 0] Starting NCCL heartbeat (background) on {device}")
 
     try:
         while True:
@@ -84,7 +88,6 @@ async def rank0_worker_loop(world_size: int) -> None:
             step += 1
 
             if step % 30 == 0:
-                # Sum of ranks 0+1+2+3 = 6
                 print(f"[Rank 0] NCCL heartbeat step={step}, sum={tensor.item():.1f}")
 
             tensor.fill_(0.0)
@@ -97,126 +100,101 @@ async def rank0_worker_loop(world_size: int) -> None:
 
 
 async def main():
-    parser = argparse.ArgumentParser(description='FT-LLM HPC Client - Phase 3')
+    parser = argparse.ArgumentParser(description='FT-LLM HPC Client - Phase 4')
     parser.add_argument('--num-gpus', type=int, default=4,
-                        help='Number of GPUs (default: 4)')
+                        help='Number of GPUs (default: 4). '
+                             'Used as a hint; actual TP size = world_size.')
     parser.add_argument('--ws-base', type=str,
                         default='wss://ft-llm-relay-production.up.railway.app',
                         help='WebSocket base URL')
     parser.add_argument('--room', type=str, default='ft-llm',
                         help='Room name (default: ft-llm)')
     parser.add_argument('--llama-device', type=str, default='cuda:0',
-                        help='Device for Llama model (only used on rank 0)')
+                        help='Device string for LLaMA when running single-process')
     parser.add_argument('--llama-max-new-tokens', type=int, default=512,
                         help='Max new tokens per generation')
     parser.add_argument('--fake-mode', action='store_true',
                         help='Use fake inference instead of real model')
     args = parser.parse_args()
 
-    # 1) Initialize torch.distributed FIRST (before any other setup)
+    # 1) Initialize torch.distributed FIRST
     rank, world_size, local_rank = init_distributed(backend="nccl")
 
-    # Only rank 0 prints the banner to avoid spam
+    # Only rank 0 prints the big banner to avoid spam
     if rank == 0:
         print("=" * 60)
-        print("FT-LLM HPC Client - Phase 3 (NCCL + Real LLaMA)")
+        print("FT-LLM HPC Client - Phase 4 (TP Engine + NCCL + Real LLaMA)")
         print("=" * 60)
         print(f"  WebSocket Base: {args.ws_base}")
         print(f"  Room:           {args.room}")
         print(f"  Requested GPUs: {args.num_gpus}")
+        print(f"  World size:     {world_size}")
         print(f"  LLaMA device:   {args.llama_device}")
         print(f"  Max tokens:     {args.llama_max_new_tokens}")
         print(f"  Fake mode:      {args.fake_mode}")
-        print(f"  World size:     {world_size}")
         print("=" * 60)
 
     print(f"[HPC] rank={rank}, world_size={world_size}, local_rank={local_rank}")
 
-    # WebSocket configuration env vars
+    # WebSocket configuration env vars (used by HPCWebSocketClient)
     os.environ['WS_BASE'] = args.ws_base
     os.environ['WS_ROOM'] = args.room
     os.environ['NUM_GPUS'] = str(world_size if world_size > 1 else args.num_gpus)
 
-    # Effective number of GPUs = distributed world size
+    # Effective TP size = distributed world size if >1, else num_gpus hint
     effective_num_gpus = world_size if world_size > 1 else args.num_gpus
 
-    # 2) Branch on rank
+    # ==============================================================
+    # Non-zero ranks: just run the worker heartbeat loop
+    # ==============================================================
     if rank != 0:
-        # ============================
-        # Non-zero ranks: worker loop
-        # ============================
         try:
             await distributed_worker_loop(rank, world_size)
         finally:
             destroy_distributed()
         return
 
-    # ============================
-    # Rank 0: Main server
-    # ============================
+    # ==============================================================
+    # Rank 0: main TP engine + WebSocket server
+    # ==============================================================
 
-    # Load model (optional fake mode)
-    llama = None
-    if not args.fake_mode:
-        try:
-            if torch.cuda.is_available():
-                # Use local_rank for device to ensure rank 0 uses GPU 0
-                device = f"cuda:{local_rank}"
-                llama = LlamaChatModel(
-                    device=device,
-                    max_new_tokens=args.llama_max_new_tokens,
-                )
-            else:
-                print("[HPC] CUDA not available, falling back to fake mode")
-        except Exception as e:
-            print(f"[HPC] Failed to load model: {e}")
-            print("[HPC] Falling back to fake mode")
-            llama = None
+    # Choose device for LLaMA on rank 0:
+    # - In multi-process mode, prefer cuda:local_rank
+    # - In single-process mode, use the CLI arg directly
+    if world_size > 1 and torch.cuda.is_available():
+        llama_device = f"cuda:{local_rank}"
+    else:
+        llama_device = args.llama_device
 
-    # Create WebSocket client with num_gpus = world_size
+    # Create the TP engine (may or may not load a real model based on fake_mode)
+    tp_engine = TPModelEngine(
+        rank=rank,
+        world_size=world_size,
+        local_rank=local_rank,
+        fake_mode=args.fake_mode,
+        llama_device=llama_device,
+        max_new_tokens=args.llama_max_new_tokens,
+    )
+
+    # Create WebSocket client with num_gpus = TP size
     client = HPCWebSocketClient(num_gpus=effective_num_gpus)
 
-    # Prompt handler
+    # Prompt handler wired into TP engine
     async def on_prompt(request_id: str, prompt: str):
-        if llama is None:
-            await client.default_prompt_handler(request_id, prompt)
-            return
-
-        await client.send_event(
-            f"🧠 [rank 0, TP={effective_num_gpus}] Generating (max {args.llama_max_new_tokens} tokens)..."
-        )
-
-        try:
-            token_count = 0
-            async for chunk, finished in llama.stream_tokens(
-                prompt,
-                max_new_tokens=args.llama_max_new_tokens,
-            ):
-                await client.send_token(request_id, chunk, finished=finished)
-                token_count += len(chunk.split())
-
-            await client.send_event(f"✅ Generation complete (~{token_count} words)")
-
-        except Exception as e:
-            err_msg = f"Model error: {e}"
-            print("[HPC] " + err_msg)
-            await client.send_event(f"❌ {err_msg}")
-            await client.send_token(request_id, "\n[Model error]\n", finished=True)
+        await tp_engine.handle_prompt(client, request_id, prompt)
 
     client.on_prompt = on_prompt
 
     # 3) Run WebSocket client + NCCL heartbeat concurrently
     try:
         if world_size > 1:
-            # Run both WebSocket client and NCCL heartbeat
             await asyncio.gather(
-                client.run(),
-                rank0_worker_loop(world_size),
+                client.run(),          # handles UI <-> HPC traffic
+                rank0_worker_loop(world_size),  # keeps rank 0 in NCCL collectives
             )
         else:
-            # Single process mode - just run WebSocket client
+            # Single-process mode: just run client
             await client.run()
-
     except KeyboardInterrupt:
         print("\n[HPC] Shutting down (KeyboardInterrupt)...")
         client.stop()
@@ -226,3 +204,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
+
