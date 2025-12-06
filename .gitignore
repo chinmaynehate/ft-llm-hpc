@@ -29,9 +29,10 @@ ft-llm-*.err
 .DS_Store
 Thumbs.db
 
-# Environment
+# Environment / Secrets
 .env
 .env.local
+*.token
 
 # Model weights (don't commit large files)
 *.pt
@@ -40,3 +41,7 @@ Thumbs.db
 *.safetensors
 weights/
 checkpoints/
+models/
+
+# HuggingFace cache
+.cache/
