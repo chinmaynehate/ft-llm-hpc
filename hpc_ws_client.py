@@ -8,12 +8,12 @@ import time
 import random
 import websockets
 
-# NEW: GPU monitor
+# GPU monitor
 try:
-    from gpu_monitor import GPUMonitor, GPUMonitorUnavailable
-except Exception:
+    from gpu_monitor import GPUMonitor
+except ImportError:
     GPUMonitor = None
-    GPUMonitorUnavailable = Exception
+    print("[HPC] GPUMonitor not available; using fake metrics")
 
 
 def build_ws_url(default_role="hpc"):
@@ -63,21 +63,26 @@ class HPCWebSocketClient:
         self.on_kill_gpu = None
         self.on_prompt = None
 
-        # NEW: GPU monitor (NVML)
+        # GPU monitor (NVML)
         self.gpu_monitor = None
         if use_gpu_monitor and GPUMonitor is not None:
             try:
                 self.gpu_monitor = GPUMonitor()
-                # If nvml reports fewer devices than requested, clamp
-                if self.gpu_monitor.device_count < self.num_gpus:
-                    print(f"[HPC] GPUMonitor: only {self.gpu_monitor.device_count} GPUs visible, "
-                          f"clamping from {self.num_gpus}")
-                    self.num_gpus = self.gpu_monitor.device_count
-                    # Ensure gpu_states matches
-                    self.gpu_states = {i: 'healthy' for i in range(self.num_gpus)}
-                print(f"[HPC] GPUMonitor initialized, device_count={self.gpu_monitor.device_count}")
-            except GPUMonitorUnavailable as e:
-                print(f"[HPC] GPUMonitor unavailable, falling back to fake metrics: {e}")
+                if self.gpu_monitor.initialize():
+                    # Clamp to actual visible GPUs
+                    if self.gpu_monitor.device_count < self.num_gpus:
+                        print(
+                            f"[HPC] GPUMonitor: only {self.gpu_monitor.device_count} GPUs visible, "
+                            f"clamping from {self.num_gpus}"
+                        )
+                        self.num_gpus = self.gpu_monitor.device_count
+                        self.gpu_states = {i: 'healthy' for i in range(self.num_gpus)}
+                    print(f"[HPC] GPUMonitor initialized, device_count={self.gpu_monitor.device_count}")
+                else:
+                    print("[HPC] GPUMonitor failed to initialize; using fake metrics")
+                    self.gpu_monitor = None
+            except Exception as e:
+                print(f"[HPC] GPUMonitor error: {e}; using fake metrics")
                 self.gpu_monitor = None
         else:
             print("[HPC] GPUMonitor disabled or not importable; using fake metrics")
@@ -102,32 +107,23 @@ class HPCWebSocketClient:
         for i in range(self.num_gpus):
             state = self.gpu_states.get(i, 'healthy')
 
-            # Default/fallback values
-            vram_used = 0.0
-            vram_total = 48.0  # A40 default; will be overwritten if NVML available
-
-            if self.gpu_monitor is not None:
-                try:
-                    info = self.gpu_monitor.get_device_info(i)
-                    vram_used = info["vram_used_gb"]
-                    vram_total = info["vram_total_gb"]
-                except Exception as e:
-                    # If NVML read fails mid-run, log once and fall back to fake
-                    print(f"[HPC] GPUMonitor error on GPU {i}: {e}")
-                    vram_used = self._fake_vram_usage(state)
+            if self.gpu_monitor is not None and self.gpu_monitor.initialized:
+                # Use the helper that already does NVML -> GB conversion
+                info = self.gpu_monitor.get_status_for_ws(i, state=state)
+                # Ensure FT state (failed/recovering) wins
+                info["state"] = state
+                gpus.append(info)
             else:
                 vram_used = self._fake_vram_usage(state)
-
-            # For failed GPUs, force VRAM to 0 to visually reflect death
-            if state == 'failed':
-                vram_used = 0.0
-
-            gpus.append({
-                "id": i,
-                "state": state,
-                "vram_used_gb": float(vram_used),
-                "vram_total_gb": float(vram_total),
-            })
+                vram_total = 48.0  # default A40 48GB
+                if state == 'failed':
+                    vram_used = 0.0
+                gpus.append({
+                    "id": i,
+                    "state": state,
+                    "vram_used_gb": round(float(vram_used), 2),
+                    "vram_total_gb": float(vram_total),
+                })
 
         return {
             "type": "gpu_status",
@@ -345,7 +341,6 @@ class HPCWebSocketClient:
                 await asyncio.sleep(3)
 
         print("[HPC] Client stopped")
-        # NEW: shut down NVML cleanly
         if self.gpu_monitor is not None:
             self.gpu_monitor.shutdown()
 
@@ -368,4 +363,3 @@ async def run_hpc_client():
 
 if __name__ == "__main__":
     asyncio.run(run_hpc_client())
-
